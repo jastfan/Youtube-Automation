@@ -2839,8 +2839,8 @@ def upgrade_yt_dlp_silently():
 
 
 def main():
-    # Render automatically port assign karta hai, agar na mile to default 5786 use karega
-      threading.Thread(target=upgrade_yt_dlp_silently, daemon=True).start()
+    # Run the yt-dlp silent upgrade check in the background
+    threading.Thread(target=upgrade_yt_dlp_silently, daemon=True).start()
 
     port = int(os.environ.get("PORT", 5786))
     url = f"http://127.0.0.1:{port}/"
