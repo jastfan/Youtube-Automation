@@ -132,6 +132,13 @@ def _ydl_base_opts():
     opts = {
         'quiet': True, 'no_warnings': True, 'noplaylist': True,
         'socket_timeout': 15, 'retries': 2, 'extractor_retries': 1,
+        'geo_bypass': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'android', 'mweb'],
+                'player-client': 'ios,android,mweb'
+            }
+        }
     }
     if COOKIES_FILE.exists():
         opts['cookiefile'] = str(COOKIES_FILE)
@@ -142,12 +149,53 @@ def resolve_stream(url, max_height):
     ydl_opts = _ydl_base_opts()
     ydl_opts['format'] = f'bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={max_height}][ext=mp4]/best'
 
+    # Prepare a cascade of attempts to bypass YouTube blocks:
+    # 1. Custom client bypass (ios, android, mweb) which works best on servers/domains without cookies
+    # 2. Local cookies.txt (if it exists)
+    # 3. Local browser cookies (if on a local dev machine)
+    # 4. Default vanilla fallback
+    attempts = []
+    
+    # Mode A: Bypassing using specialized iOS/Android player clients (highly resilient on server IPs)
+    attempts.append("bypass")
+    
+    # Mode B: Cookies file if provided
+    if COOKIES_FILE.exists():
+        attempts.append("cookies_file")
+        
+    # Mode C: Local browser databases (great for local machine dev, completely skipped on headless servers safely)
+    attempts.extend(COOKIE_BROWSERS)
+    
+    # Mode D: Clean vanilla fallback
+    attempts.append("default")
+
     last_err = None
-    attempts = [None] if COOKIES_FILE.exists() else COOKIE_BROWSERS + [None]
-    for browser in attempts:
+    for mode in attempts:
         opts = dict(ydl_opts)
-        if browser:
-            opts['cookiesfrombrowser'] = (browser,)
+        
+        if mode == "bypass":
+            # Set the ultimate player_client list which completely circumvents the 'Sign in to confirm you are not a bot' enforcement
+            opts.pop('cookiefile', None)
+            opts['extractor_args'] = {
+                'youtube': {
+                    'player_client': ['ios', 'android', 'mweb'],
+                    'player-client': 'ios,android,mweb'
+                }
+            }
+        elif mode == "cookies_file":
+            if COOKIES_FILE.exists():
+                opts['cookiefile'] = str(COOKIES_FILE)
+                # Keep extractor_args as fallback
+            else:
+                continue
+        elif mode in COOKIE_BROWSERS:
+            opts.pop('cookiefile', None)
+            opts['cookiesfrombrowser'] = (mode,)
+        elif mode == "default":
+            # Reset all custom args as final raw fallback
+            opts.pop('cookiefile', None)
+            opts.pop('extractor_args', None)
+            
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -323,17 +371,14 @@ def api_fetch_and_cut_start():
 
 @app.route("/api/cut_status/<job_id>")
 def api_cut_status(job_id):
-    """Returns only the clips not yet seen by this poller (via ?after=N index
-    count), plus done/error flags — keeps the response tiny and lets the UI
-    show each short as soon as it exists."""
+    """Returns all clips sorted by index, plus done/error flags."""
     job = JOBS.get(job_id)
     if not job:
         return jsonify({"error": "Unknown job"}), 404
-    after = int(request.args.get("after", 0))
-    new_clips = sorted(job["clips"], key=lambda c: c["index"])[after:]
+    clips = sorted(job["clips"], key=lambda c: c["index"])
     return jsonify({
         "title": job["title"], "error": job["error"], "done": job["done"],
-        "total": job["total"], "seen": after + len(new_clips), "clips": new_clips,
+        "total": job["total"], "clips": clips,
     })
 
 
@@ -659,8 +704,10 @@ def build_and_run_export(src, w, h, s, title, progress_callback=None, src_durati
         vf.append(f"curves=preset={look['curves']}")
     if look.get("colorchannelmixer"):
         vf.append(f"colorchannelmixer={look['colorchannelmixer']}")
-    if look.get("vignette"):
+    if s.get("vignette") or look.get("vignette"):
         vf.append("vignette=PI/4")
+    if s.get("film_grain"):
+        vf.append("noise=alls=3:allf=t")
     if sharpen:
         vf.append("unsharp=5:5:0.6:5:5:0.0")
     if abs(speed - 1.0) > 1e-3:
@@ -790,6 +837,11 @@ def build_and_run_export(src, w, h, s, title, progress_callback=None, src_durati
     filter_complex = ";".join(fc)
     cmd += ["-filter_complex", filter_complex, "-map", f"[{cur}]"]
 
+    pitch_af = None
+    if s.get("audio_pitch"):
+        # We can shift pitch slightly (e.g. 1.025x which is about +40 cents, completely natural for humans but breaks audio hashing algorithms)
+        pitch_af = f"asetrate=44100*1.025,atempo={1/1.025:.4f}"
+
     if audio_mode == "mute":
         cmd += ["-an"]
     elif extra_audio_idx is not None:
@@ -797,6 +849,8 @@ def build_and_run_export(src, w, h, s, title, progress_callback=None, src_durati
             a0 = "[0:a]volume=0.25"
             if abs(speed - 1.0) > 1e-3:
                 a0 += "," + atempo_chain(speed)   # keep original track in sync with sped-up video
+            if pitch_af:
+                a0 += "," + pitch_af
             a0 += "[a0]"
             cmd += ["-filter_complex:a",
                     f"{a0};[{extra_audio_idx}:a]volume=1.0[a1];[a0][a1]amix=inputs=2:duration=longest[aout]"]
@@ -805,10 +859,17 @@ def build_and_run_export(src, w, h, s, title, progress_callback=None, src_durati
             # replaced file / TTS-only audio is an independent track — it must
             # play at its own normal speed regardless of video speed changes
             cmd += ["-map", f"{extra_audio_idx}:a"]
+            if pitch_af:
+                cmd += ["-af", pitch_af]
     else:
         cmd += ["-map", "0:a?"]
+        af_parts = []
+        if pitch_af:
+            af_parts.append(pitch_af)
         if abs(speed - 1.0) > 1e-3:
-            cmd += ["-af", atempo_chain(speed)]
+            af_parts.append(atempo_chain(speed))
+        if af_parts:
+            cmd += ["-af", ",".join(af_parts)]
 
     out_name = f"{title}_final_{uuid.uuid4().hex[:6]}.{ext}"
     out_path = OUTPUT_DIR / out_name
@@ -1149,7 +1210,7 @@ button:disabled {
         </div>
         <div>
           <label style="font-size: 11px; text-transform: uppercase; color: var(--dim); display: block; margin-bottom: 4px;">Logo Font Size</label>
-          <input type="number" id="automodFontSize" value="16" min="12" max="100">
+          <input type="number" id="automodFontSize" value="36" min="12" max="100">
         </div>
         <div style="display: flex; flex-direction: column; justify-content: center;">
           <div class="checkrow" style="margin: 0;">
@@ -1179,6 +1240,27 @@ button:disabled {
           </div>
           <span style="font-size: 10px; color: var(--dim); margin-left: 20px; display: block; margin-top: 2px;">Cuts into clean 10s blocks (1-11, 11-21)</span>
         </div>
+        <div style="display: flex; flex-direction: column; justify-content: center;">
+          <div class="checkrow" style="margin: 0;">
+            <input type="checkbox" id="automodFilmGrain" checked>
+            <span style="font-weight: 600;">🎞️ Anti-Copyright Film Grain / Noise</span>
+          </div>
+          <span style="font-size: 10px; color: var(--dim); margin-left: 20px; display: block; margin-top: 2px;">Adds micro-noise to scramble pixel-matching hashes</span>
+        </div>
+        <div style="display: flex; flex-direction: column; justify-content: center;">
+          <div class="checkrow" style="margin: 0;">
+            <input type="checkbox" id="automodAudioPitch" checked>
+            <span style="font-weight: 600;">🎙️ Anti-Copyright Audio Pitch Tuning</span>
+          </div>
+          <span style="font-size: 10px; color: var(--dim); margin-left: 20px; display: block; margin-top: 2px;">Micro-shift audio frequency to bypass acoustic matching</span>
+        </div>
+        <div style="display: flex; flex-direction: column; justify-content: center;">
+          <div class="checkrow" style="margin: 0;">
+            <input type="checkbox" id="automodVignette" checked>
+            <span style="font-weight: 600;">📐 Dark Vignette Border Overlay</span>
+          </div>
+          <span style="font-size: 10px; color: var(--dim); margin-left: 20px; display: block; margin-top: 2px;">Adds corner shading to break visual fingerprinting</span>
+        </div>
       </div>
     </div>
 
@@ -1194,6 +1276,37 @@ button:disabled {
       </div>
     </div>
     <div class="grid" id="clipGrid"></div>
+  </div>
+
+  <!-- Polished Exported Video Downloader & Batch Manager Panel -->
+  <div class="card hidden" id="downloadsCard" style="margin-top: 20px;">
+    <div class="flex-between" style="align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 15px;">
+      <h3 style="margin:0; display:flex; align-items:center; gap:8px;">
+        <span style="color:var(--yellow)">📦</span> Exported Downloads Manager
+      </h3>
+      <div style="display:flex; gap:10px; align-items:center;">
+        <button class="btn-grad" id="downloadSelectedBtn" onclick="downloadSelectedVideos()" style="padding: 6px 12px; font-size:12px; margin:0; cursor:pointer;">📥 Download Selected</button>
+        <button class="btn-grad" id="selectAllExportsBtn" onclick="toggleSelectAllExports()" style="padding: 6px 12px; font-size:12px; margin:0; cursor:pointer; background:#434348;">✅ Toggle All</button>
+      </div>
+    </div>
+    
+    <div style="overflow-x: auto;">
+      <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 13px;">
+        <thead>
+          <tr style="border-bottom: 2px solid var(--border); color: var(--dim);">
+            <th style="padding: 8px; width: 40px;">Select</th>
+            <th style="padding: 8px;">Video Title</th>
+            <th style="padding: 8px;">Specifications</th>
+            <th style="padding: 8px; width: 150px; text-align: right;">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="exportedVideosList">
+          <tr id="emptyExportRow">
+            <td colspan="4" style="padding: 20px; text-align: center; color: var(--dim);">No videos successfully exported yet. Click "Export Video" on a card or run a batch export!</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 
   <div class="card editor" id="editorCard">
@@ -1475,6 +1588,10 @@ function addClipCard(c){
     if (replaceAudioChecked && audioLibraryFiles && audioLibraryFiles.length > 0) {
       chosenAudioUrl = audioLibraryFiles[(c.index - 1) % audioLibraryFiles.length].url;
     }
+
+    const grainChecked = document.getElementById('automodFilmGrain') ? document.getElementById('automodFilmGrain').checked : true;
+    const pitchChecked = document.getElementById('automodAudioPitch') ? document.getElementById('automodAudioPitch').checked : true;
+    const vignetteChecked = document.getElementById('automodVignette') ? document.getElementById('automodVignette').checked : true;
     
     clipSettingsMap[c.clip_id] = {
       speed: 0.75,
@@ -1486,6 +1603,9 @@ function addClipCard(c){
       brightness: brightnessVal,
       sharpen: true,
       enhance: true,
+      film_grain: grainChecked,
+      audio_pitch: pitchChecked,
+      vignette: vignetteChecked,
       color_preset: selectedPreset,
       resolution: '1080x1920',
       format: 'mp4',
@@ -1511,6 +1631,7 @@ function addClipCard(c){
   div = document.createElement('div');
   div.className = 'clip-card';
   div.id = 'card_' + c.clip_id;
+  div.dataset.index = c.index;
   
   // Set direct CSS mirror transform on card video if active
   const mirrorStyle = s.hflip ? 'transform: scaleX(-1);' : '';
@@ -1556,6 +1677,11 @@ function addClipCard(c){
   
   div.onclick = () => openEditor(c.clip_id);
   grid.appendChild(div);
+
+  // Dynamic DOM sorting: keep the clips strictly sequential (Short 1, Short 2, Short 3...)
+  const cards = Array.from(grid.children);
+  cards.sort((a, b) => parseInt(a.dataset.index || 0) - parseInt(b.dataset.index || 0));
+  cards.forEach(card => grid.appendChild(card));
   
   // Render settings badges inside the card
   updateClipCardBadge(c.clip_id);
@@ -1601,23 +1727,26 @@ async function fetchAndCut(){
   const data = await res.json();
   if(data.error){ log('fetchLog', '❌ '+data.error); return; }
   const jobId = data.job_id;
-  let seen = 0, done = false, total = 0;
+  const processedClipIds = new Set();
+  let done = false, total = 0;
   while(!done){
     await new Promise(r=>setTimeout(r, 700));
-    const st = await fetch(`/api/cut_status/${jobId}?after=${seen}`);
+    const st = await fetch(`/api/cut_status/${jobId}`);
     const sd = await st.json();
     if(sd.error){ log('fetchLog', '❌ '+sd.error); return; }
     total = sd.total;
     sd.clips.forEach(c=>{
-      addClipCard(c); // each short appears the moment it's ready, no waiting for the rest
-      log('fetchLog', `✅ Short ${c.index}/${total||'?'} ready — "${c.label}"`);
-      // Add to automatic queue for background export if Automod is enabled!
-      if (document.getElementById('autoMode') && document.getElementById('autoMode').checked) {
-        exportQueue.push(c);
-        if(!exportQueueActive) processNextExport();
+      if (!processedClipIds.has(c.clip_id)) {
+        processedClipIds.add(c.clip_id);
+        addClipCard(c); // each short appears the moment it's ready, no waiting for the rest
+        log('fetchLog', `✅ Short ${c.index}/${total||'?'} ready — "${c.label}"`);
+        // Add to automatic queue for background export if Automod is enabled!
+        if (document.getElementById('autoMode') && document.getElementById('autoMode').checked) {
+          exportQueue.push(c);
+          if(!exportQueueActive) processNextExport();
+        }
       }
     });
-    seen = sd.seen;
     done = sd.done;
   }
   const secs = ((performance.now()-t0)/1000).toFixed(1);
@@ -1893,7 +2022,7 @@ async function generateTTS(){
 
 function addTextLayer(){
   const layer = {id: 'txt'+Date.now(), content: 'Your text', x: 0.1, y: 0.75 - textLayers.length*0.08,
-                 size: 16, color: '#ffffff', box: true, enabled: true};
+                 size: 36, color: '#ffffff', box: true, enabled: true};
   textLayers.push(layer);
   renderTextPanelRow(layer);
   renderTextOnStage(layer);
@@ -2127,7 +2256,7 @@ async function saveVideo(){
         if(pFill) pFill.style.width = '100%';
         if(pText) pText.innerText = '100%';
         const secs = ((performance.now()-t0)/1000).toFixed(1);
-        log('exportLog', `✅ Saved in ${secs}s! <a class="dl-link" href="${sd.url}" target="_blank">Download / open file</a> (also saved on disk at ${sd.path})`);
+        log('exportLog', `✅ Saved in ${secs}s! <a class="dl-link" href="javascript:void(0)" onclick="triggerInlineDownload('${sd.url}', '${sd.url.split('/').pop()}')">Download / open file</a> (also saved on disk at ${sd.path})`);
         if(saveBtn) saveBtn.disabled = false;
       } else if(sd.status === 'failed'){
         done = true;
@@ -2208,6 +2337,9 @@ function getAutoSettingsForClip(clipId, index, audioFiles, stageWidth, stageHeig
   let logo = null;
   let stage_w = stageWidth || 360;
   let stage_h = stageHeight || 640;
+  let film_grain = true;
+  let audio_pitch = true;
+  let vignette = true;
 
   const speedEl = document.getElementById('speed');
   if (speedEl) {
@@ -2241,6 +2373,9 @@ function getAutoSettingsForClip(clipId, index, audioFiles, stageWidth, stageHeig
       stage_w = stageRect.width || 360;
       stage_h = stageRect.height || 640;
     }
+    film_grain = document.getElementById('automodFilmGrain') ? document.getElementById('automodFilmGrain').checked : true;
+    audio_pitch = document.getElementById('automodAudioPitch') ? document.getElementById('automodAudioPitch').checked : true;
+    vignette = document.getElementById('automodVignette') ? document.getElementById('automodVignette').checked : true;
   }
 
   const settings = {
@@ -2269,7 +2404,11 @@ function getAutoSettingsForClip(clipId, index, audioFiles, stageWidth, stageHeig
     rotate,
     hflip,
     stage_w,
-    stage_h
+    stage_h,
+    film_grain,
+    audio_pitch,
+    vignette,
+    clip_index: index
   };
 
   // Automatically replace audio file round-robin line-by-line if replaced file mode is active or Automod is checked
@@ -2305,8 +2444,13 @@ async function processNextExport() {
       audioLibraryFiles = data.files || [];
     }
     
-    // Get stage dimension approximation or use default standard
-    const settings = getAutoSettingsForClip(c.clip_id, index, audioLibraryFiles, 360, 640);
+    // Prefer card-specific settings if they exist, otherwise fallback to global/auto settings
+    let settings = clipSettingsMap[c.clip_id];
+    if (!settings) {
+      settings = getAutoSettingsForClip(c.clip_id, index, audioLibraryFiles, 360, 640);
+    } else {
+      settings.clip_index = index;
+    }
     
     const res = await fetch('/api/export', {
       method: 'POST',
@@ -2348,9 +2492,11 @@ async function processNextExport() {
         if (actions) {
           actions.innerHTML = `
             <button class="clip-card-btn edit-btn" onclick="event.stopPropagation(); openEditor('${c.clip_id}')">⚙️ Edit</button>
-            <a class="clip-card-btn dl-btn" onclick="event.stopPropagation()" href="${sd.url}" target="_blank">📥 Save to PC</a>
+            <button class="clip-card-btn dl-btn" onclick="event.stopPropagation(); triggerInlineDownload('${sd.url}', '${sd.url.split('/').pop()}')">📥 Save to PC</button>
           `;
         }
+        // Add to our modern Exported Downloads Manager list
+        addExportToDownloadsList(c.clip_id, c.label, sd.url, settings);
       } else if (sd.status === 'failed') {
         done = true;
         throw new Error(sd.error);
@@ -2360,8 +2506,7 @@ async function processNextExport() {
     console.error(e);
     if (statusTxt) statusTxt.innerText = '❌ Failed';
     if (statusOverlay) {
-      statusOverlay.classList.remove('active');
-      statusOverlay.classList.add('failed');
+      statusOverlay.className = 'clip-status-overlay failed';
     }
   }
   
@@ -2526,15 +2671,177 @@ async function exportSingleClip(clipId) {
     processNextExport();
   }
 }
+
+// ──────────────────────── Exported Downloads & Batch Manager ────────────────────────
+let exportedVideos = []; // array of {clipId, label, url, settings, filename}
+let allSelectedExports = true;
+
+function addExportToDownloadsList(clipId, label, url, settings) {
+  document.getElementById('downloadsCard').classList.remove('hidden');
+  const emptyRow = document.getElementById('emptyExportRow');
+  if (emptyRow) {
+    emptyRow.remove();
+  }
+  
+  // Prevent duplicate items in list
+  if (exportedVideos.some(v => v.clipId === clipId)) {
+    const idx = exportedVideos.findIndex(v => v.clipId === clipId);
+    exportedVideos[idx] = { clipId, label, url, settings, filename: url.split('/').pop() };
+    renderExportedVideosTable();
+    return;
+  }
+  
+  exportedVideos.push({
+    clipId,
+    label,
+    url,
+    settings,
+    filename: url.split('/').pop()
+  });
+  
+  renderExportedVideosTable();
+}
+
+function renderExportedVideosTable() {
+  const tbody = document.getElementById('exportedVideosList');
+  if (exportedVideos.length === 0) {
+    tbody.innerHTML = `
+      <tr id="emptyExportRow">
+        <td colspan="4" style="padding: 20px; text-align: center; color: var(--dim);">No videos successfully exported yet. Click "Export Video" on a card or run a batch export!</td>
+      </tr>
+    `;
+    return;
+  }
+  
+  tbody.innerHTML = '';
+  exportedVideos.forEach(v => {
+    let presetName = v.settings.color_preset || 'none';
+    presetName = presetName.charAt(0).toUpperCase() + presetName.slice(1);
+    
+    let audioName = v.settings.audio_file_url ? v.settings.audio_file_url.split('/').pop() : 'Original';
+    if (audioName.length > 20) audioName = audioName.slice(0, 17) + '...';
+    
+    const row = document.createElement('tr');
+    row.style.borderBottom = '1px solid var(--border)';
+    row.style.background = 'rgba(255,255,255,0.01)';
+    row.innerHTML = `
+      <td style="padding: 10px 8px; vertical-align: middle;">
+        <input type="checkbox" class="export-download-chk" checked data-url="${v.url}" data-fname="${v.filename}" style="width:16px; height:16px; cursor:pointer;">
+      </td>
+      <td style="padding: 10px 8px; font-weight: 600; color: #fff; vertical-align: middle;">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span>🎬</span>
+          <div>
+            <div style="font-size:13px; color:#fff;">${v.label}</div>
+            <div style="font-size:11px; color:var(--dim); font-weight:normal;">File: ${v.filename}</div>
+          </div>
+        </div>
+      </td>
+      <td style="padding: 10px 8px; vertical-align: middle;">
+        <div style="display:flex; flex-wrap:wrap; gap:6px; font-size:11px;">
+          <span style="background:rgba(255,193,7,0.15); color:#ffc107; padding:2px 6px; border-radius:4px; font-weight:bold;">⚡ ${v.settings.speed}x</span>
+          <span style="background:rgba(23,162,184,0.15); color:#17a2b8; padding:2px 6px; border-radius:4px; font-weight:bold;">🔍 ${v.settings.zoom}x</span>
+          <span style="background:rgba(32,201,151,0.15); color:#20c997; padding:2px 6px; border-radius:4px; font-weight:bold;">🎨 ${presetName}</span>
+          <span style="background:rgba(253,126,20,0.15); color:#fd7e14; padding:2px 6px; border-radius:4px; font-weight:bold;">🪞 Mirror: ${v.settings.hflip ? 'Yes' : 'No'}</span>
+          <span style="background:rgba(111,66,193,0.15); color:#6f42c1; padding:2px 6px; border-radius:4px; font-weight:bold; max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${v.settings.audio_file_url ? v.settings.audio_file_url.split('/').pop() : ''}">🎵 ${audioName}</span>
+        </div>
+      </td>
+      <td style="padding: 10px 8px; text-align: right; vertical-align: middle;">
+        <div style="display:flex; justify-content:flex-end; gap:6px;">
+          <button class="clip-card-btn" style="padding: 4px 8px; font-size:11px; background:var(--grad); color:#000; font-weight:bold; cursor:pointer;" onclick="triggerInlineDownload('${v.url}', '${v.filename}')">📥 Download</button>
+          <button class="clip-card-btn" style="padding: 4px 8px; font-size:11px; background:#434348; color:#fff; cursor:pointer;" onclick="playExportedVideo('${v.url}')">▶ Play</button>
+        </div>
+      </td>
+    `;
+    tbody.appendChild(row);
+  });
+}
+
+function triggerInlineDownload(url, filename) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.setAttribute('download', filename || '');
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+function playExportedVideo(url) {
+  const modal = document.createElement('div');
+  modal.style.position = 'fixed';
+  modal.style.top = '0';
+  modal.style.left = '0';
+  modal.style.width = '100vw';
+  modal.style.height = '100vh';
+  modal.style.background = 'rgba(0,0,0,0.85)';
+  modal.style.zIndex = '99999';
+  modal.style.display = 'flex';
+  modal.style.flexDirection = 'column';
+  modal.style.alignItems = 'center';
+  modal.style.justifyContent = 'center';
+  modal.style.gap = '15px';
+  modal.id = 'temp_video_modal';
+  
+  modal.innerHTML = `
+    <div style="position:relative; width:90%; max-width:400px; aspect-ratio:9/16; background:#000; border-radius:12px; overflow:hidden; border:2px solid var(--border); box-shadow:0 0 30px rgba(0,0,0,0.5);">
+      <video src="${url}" controls autoplay loop style="width:100%; height:100%; object-fit:contain;"></video>
+      <button onclick="document.getElementById('temp_video_modal').remove()" style="position:absolute; top:12px; right:12px; width:32px; height:32px; border-radius:50%; background:rgba(0,0,0,0.7); color:#fff; border:1px solid rgba(255,255,255,0.2); cursor:pointer; font-size:16px; font-weight:bold; display:flex; align-items:center; justify-content:center; transition:0.2s;">✕</button>
+    </div>
+    <div style="display:flex; gap:10px;">
+      <button class="btn-grad" onclick="triggerInlineDownload('${url}', '${url.split('/').pop()}'); document.getElementById('temp_video_modal').remove();" style="padding:8px 16px; font-size:13px; color:#000; font-weight:bold; border-radius:6px; cursor:pointer;">📥 Download Video</button>
+      <button onclick="document.getElementById('temp_video_modal').remove()" style="padding:8px 16px; background:#333; color:#fff; border:1px solid #444; border-radius:6px; cursor:pointer; font-size:13px;">Close Preview</button>
+    </div>
+  `;
+  document.body.appendChild(modal);
+}
+
+function toggleSelectAllExports() {
+  allSelectedExports = !allSelectedExports;
+  document.querySelectorAll('.export-download-chk').forEach(chk => {
+    chk.checked = allSelectedExports;
+  });
+}
+
+async function downloadSelectedVideos() {
+  const selectedCheckboxes = document.querySelectorAll('.export-download-chk:checked');
+  if (selectedCheckboxes.length === 0) {
+    alert("Please select at least one exported video to download.");
+    return;
+  }
+  for (let i = 0; i < selectedCheckboxes.length; i++) {
+    const url = selectedCheckboxes[i].dataset.url;
+    const fname = selectedCheckboxes[i].dataset.fname;
+    
+    triggerInlineDownload(url, fname);
+    
+    // Wait slightly between downloads to avoid browser block
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
 </script>
 </body>
 </html>
 """
 
 
+def upgrade_yt_dlp_silently():
+    import sys
+    import subprocess
+    try:
+        print("[Auto-Update] Checking and upgrading yt-dlp to the latest version to prevent bot-detection issues...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("[Auto-Update] yt-dlp has been updated to the latest secure version.")
+    except Exception as e:
+        print(f"[Auto-Update Warning] Could not auto-upgrade yt-dlp: {e}")
+
+
+
 
 def main():
     # Render automatically port assign karta hai, agar na mile to default 5786 use karega
+      threading.Thread(target=upgrade_yt_dlp_silently, daemon=True).start()
+
     port = int(os.environ.get("PORT", 5786))
     url = f"http://127.0.0.1:{port}/"
     threading.Timer(1.0, lambda: webbrowser.open(url)).start()
