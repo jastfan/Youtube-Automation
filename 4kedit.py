@@ -2532,8 +2532,10 @@ async function exportSingleClip(clipId) {
 """
 
 
+
 def main():
-    port = 5786
+    # Render automatically port assign karta hai, agar na mile to default 5786 use karega
+    port = int(os.environ.get("PORT", 5786))
     url = f"http://127.0.0.1:{port}/"
     threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     print(f"Shorts Studio running at {url}")
@@ -2543,8 +2545,33 @@ def main():
         print("NOTE: edge-tts not installed — Microsoft AI voiceover will be disabled. Run: pip install edge-tts")
     if not GTTS_OK:
         print("NOTE: gTTS not installed — Google AI voiceover will be disabled. Run: pip install gTTS")
-    app.run(host="127.0.0.1", port=port, debug=False)
+    
+    # Host ko "0.0.0.0" kiya hai taaki Render ise public internet par live kar sake
+    app.run(host="0.0.0.0", port=port, debug=False)
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+# def main():
+#     port = 5786
+#     url = f"http://127.0.0.1:{port}/"
+#     threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+#     print(f"Shorts Studio running at {url}")
+#     print(f"Parallel clip-cutting workers: {MAX_CUT_WORKERS}")
+#     print(f"Audio library folder: {AUDIO_LIB_DIR} (drop .mp3 files here)")
+#     if not EDGE_TTS_OK:
+#         print("NOTE: edge-tts not installed — Microsoft AI voiceover will be disabled. Run: pip install edge-tts")
+#     if not GTTS_OK:
+#         print("NOTE: gTTS not installed — Google AI voiceover will be disabled. Run: pip install gTTS")
+#     app.run(host="127.0.0.1", port=port, debug=False)
+
+
+# if __name__ == "__main__":
+#     main()
